@@ -1266,9 +1266,14 @@ impl Worker {
         }
         let mut reply = String::new();
         let mut failed = None;
+        let mut stopped_at = None::<Instant>;
         loop {
             if self.stop.is_cancelled() {
                 agent.stop();
+                let at = stopped_at.get_or_insert_with(Instant::now);
+                if at.elapsed() >= Duration::from_secs(2) {
+                    self.stop.check()?;
+                }
             }
             for e in agent.poll() {
                 if matches!(e, AgentEvent::ToolFinished { .. } | AgentEvent::TurnDone { .. }) {

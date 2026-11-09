@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Name our MCP server is registered under.
 pub const MCP_NAME: &str = "craft-anything";
@@ -995,6 +995,11 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let failed_tools = Arc::new(AtomicBool::new(false));
     let (failed_tools2, failed_tools3) = (failed_tools.clone(), failed_tools.clone());
     let stop2 = stop.clone();
+    const POST_RESULT_GRACE: Duration = Duration::from_secs(3);
+    let result_at = Arc::new(Mutex::new(None::<Instant>));
+    let (result_at2, result_at3) = (result_at.clone(), result_at.clone());
+    let reaped_after_result = Arc::new(AtomicBool::new(false));
+    let reaped_after_result2 = reaped_after_result.clone();
     let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
         .args(&argv)
         .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
@@ -1004,13 +1009,30 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     let mut proc = proc
         .stdout_cap(4 * 1024 * 1024)
-        .cancel_when(move || stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst))
+        .cancel_when(move || {
+            if stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst) {
+                return true;
+            }
+            if let Some(at) = *result_at2.lock().unwrap_or_else(PoisonError::into_inner) {
+                if at.elapsed() >= POST_RESULT_GRACE {
+                    reaped_after_result2.store(true, Ordering::SeqCst);
+                    return true;
+                }
+            }
+            false
+        })
         .on_stdout_line(move |l| {
             if failed_tools3.load(Ordering::SeqCst) {
                 return;
             }
             let mut p = p2.lock().unwrap_or_else(PoisonError::into_inner);
             let events = p.line(l);
+            if p.saw_result {
+                let mut at = result_at3.lock().unwrap_or_else(PoisonError::into_inner);
+                if at.is_none() {
+                    *at = Some(Instant::now());
+                }
+            }
             if let (Some(dir), Some(id)) = (&records, &p.run_session) {
                 let mut h = held2.lock().unwrap_or_else(PoisonError::into_inner);
                 if h.is_none() {
@@ -1061,6 +1083,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     let unfinished = match &result {
         Ok(out) => !out.success,
+        Err(_) if reaped_after_result.load(Ordering::SeqCst) => p.failure.is_some(),
         Err(_) => true,
     };
     match result {
@@ -1088,7 +1111,9 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         }
         Ok(_) => {}
         Err(e) if e.code == craft_anything_evidence::ErrorCode::Cancelled => {
-            let _ = tx.send(AgentEvent::Status { text: "Stopped.".into() });
+            if !reaped_after_result.load(Ordering::SeqCst) {
+                let _ = tx.send(AgentEvent::Status { text: "Stopped.".into() });
+            }
         }
         Err(e) => {
             let _ = tx.send(shown.error_event(&agent, e));

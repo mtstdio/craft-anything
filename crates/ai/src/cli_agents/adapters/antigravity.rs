@@ -23,8 +23,16 @@ impl AgentAdapter for Antigravity {
         if let Some(r) = cx.resume {
             a.extend(["--conversation".into(), r.to_string()]);
         }
-        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), format!("{}{}", cx.preamble, cx.prompt)]);
+        a.extend(["--input-format".into(), "text".into(), "--output-format".into(), "stream-json".into()]);
         a
+    }
+
+    fn prompt_on_stdin(&self) -> bool {
+        true
+    }
+
+    fn stdin_text(&self, preamble: &str, prompt: &str) -> String {
+        format!("{preamble}{prompt}")
     }
 
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
@@ -95,6 +103,7 @@ impl AgentAdapter for Antigravity {
                         let reply = res.get("response").and_then(Value::as_str).unwrap_or_default();
                         let why = res.get("error").and_then(Value::as_str).unwrap_or("run failed");
                         if reply.trim().is_empty() {
+                            p.failure = Some(antigravity_failure(why));
                             out.push(AgentEvent::Error { message: format!("Antigravity: {why}"), remediation: None, log: None });
                         } else {
                             // Antigravity keeps reporting a conversation's old error (its `error_id`
@@ -110,12 +119,53 @@ impl AgentAdapter for Antigravity {
             }
             "error" => {
                 let msg = v.pointer("/error/message").or_else(|| v.get("error")).and_then(Value::as_str).unwrap_or("unknown error");
+                p.failure = Some(antigravity_failure(msg));
                 out.push(AgentEvent::Error { message: format!("Antigravity: {msg}"), remediation: None, log: None });
             }
             _ => {}
         }
         out
     }
+}
+
+pub(crate) fn antigravity_failure(why: &str) -> TurnFailure {
+    let lower = why.to_ascii_lowercase();
+    let kind = if lower.contains("tls: bad record mac")
+        || lower.contains("request failed:")
+        || lower.contains("remote error:")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("stream error")
+        || lower.contains("http2:")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+    {
+        FailureKind::Transient
+    } else if lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("resource_exhausted")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+    {
+        FailureKind::RateLimited
+    } else if lower.contains("unauthenticated")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        FailureKind::Authentication
+    } else {
+        FailureKind::Unknown
+    };
+    TurnFailure::new(kind)
 }
 
 #[cfg(test)]
@@ -130,7 +180,7 @@ mod tests {
     #[test]
     fn antigravity_args_construction() {
         let default_opts = BackendOptions::default();
-        assert_eq!(args(false, None, &default_opts), ["--output-format", "stream-json", "-p", "PRE analyse repo"]);
+        assert_eq!(args(false, None, &default_opts), ["--input-format", "text", "--output-format", "stream-json"]);
 
         let builder_opts =
             BackendOptions { cli_model: Some("Gemini 3.8 Flash (Medium)".into()), args: vec!["--add-dir".into(), "/repo".into()], ..Default::default() };
@@ -144,16 +194,39 @@ mod tests {
                 "Gemini 3.8 Flash (Medium)",
                 "--conversation",
                 "conv-123",
+                "--input-format",
+                "text",
                 "--output-format",
                 "stream-json",
-                "-p",
-                "PRE analyse repo"
             ]
         );
+        assert!(Antigravity.prompt_on_stdin());
+        assert_eq!(Antigravity.stdin_text("PRE ", "prompt"), "PRE prompt");
         assert!(Antigravity.resumes());
         assert_eq!(Antigravity.required_flags(), (&["--help"][..], &["--output-format", "stream-json"][..]));
         assert!(AgentAdapters::built_in().for_agent("antigravity").ids().contains(&"antigravity"));
         assert!(AgentAdapters::built_in().for_agent("agy").ids().contains(&"agy"));
+    }
+
+    #[test]
+    fn antigravity_failure_classification() {
+        let f_tls = antigravity_failure(
+            "API error (attempt 2): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": remote error: tls: bad record MAC",
+        );
+        assert_eq!(f_tls.kind, FailureKind::Transient);
+        assert!(f_tls.retryable());
+
+        let f_rate = antigravity_failure("RESOURCE_EXHAUSTED: rate limit exceeded");
+        assert_eq!(f_rate.kind, FailureKind::RateLimited);
+        assert!(f_rate.retryable());
+
+        let f_auth = antigravity_failure("401 Unauthorized: invalid api key");
+        assert_eq!(f_auth.kind, FailureKind::Authentication);
+        assert!(!f_auth.retryable());
+
+        let f_other = antigravity_failure("something unexpected happened");
+        assert_eq!(f_other.kind, FailureKind::Unknown);
+        assert!(!f_other.retryable());
     }
 
     #[test]
@@ -267,6 +340,7 @@ mod tests {
             AgentEvent::Error { message, .. } => assert!(message.contains("authentication expired")),
             other => panic!("expected Error, got {other:?}"),
         }
+        assert_eq!(p.failure, Some(TurnFailure::new(FailureKind::Authentication)));
     }
 
     #[test]

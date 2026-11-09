@@ -1,0 +1,90 @@
+name: "Custom Build & Release"
+
+on:
+  push:
+    branches:
+      - 'bugfix/**'
+      - 'feature/**'
+      - 'release-custom'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: "Quality & Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test -p craft-anything-platform -p craft-anything-ai -p craft-anything-ui-egui
+      - name: Layers and locks check
+        run: |
+          cargo xtask layers
+          cargo xtask locks
+          cargo xtask secrets
+
+  macos:
+    name: "macOS Universal Package"
+    needs: [check]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone craft-fonts
+        run: git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts"
+      - name: Build and package macOS universal
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: packaging/macos/package.sh --arch universal
+      - name: Verify macOS package
+        run: packaging/macos/verify.sh --arch universal
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-artifacts
+          path: dist/release/*
+
+  release:
+    name: "Publish GitHub Release"
+    needs: [macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-release-artifacts
+          path: dist/release
+      - name: Resolve version
+        id: get_version
+        run: |
+          VERSION=$(awk '/^\[workspace\.package\]/ { found=1; next } found && /^version =/ { gsub(/[" ]/, "", $3); print $3; exit }' Cargo.toml)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TAG=v$VERSION" >> $GITHUB_ENV
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "Craft Anything ${{ env.TAG }}"
+          body: |
+            ## Craft Anything ${{ env.TAG }}
+            
+            ### Fixes in this release:
+            - **Antigravity Resiliency**: Fixed stream freeze and hang on API/TLS network errors (`tls: bad record MAC`); prompts now stream via stdin to prevent CLI argument overflow; automatically classifies transient errors for seamless continuation via `--conversation`.
+            - **Process Cleanup**: Enforced 3s post-result process group reaping and non-blocking process termination in `Supervisor`, eliminating hangs after stream error events.
+            - **Pause & Resume Fix**: Added 2s stop timeout in rebuild worker loop and cleaned up `pausing` state in UI on run completion to prevent getting stuck in "Pausing…".
+          files: |
+            dist/release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -307,6 +307,7 @@ impl CraftApp {
             match e {
                 RunEvent::Finished { .. } => {
                     self.asking.remove(root);
+                    self.pausing.remove(root);
                     clock.saved_again(root, false);
                     finished.push(root.clone());
                 }

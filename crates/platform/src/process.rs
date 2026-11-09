@@ -775,14 +775,25 @@ enum Stop {
 }
 
 impl Supervisor {
+    fn kill_child(&mut self) {
+        let _ = self.child.start_kill();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+    }
+
     fn run(mut self) -> Result<Output, ToolError> {
         let stop = self.watch();
         if !matches!(stop, Stop::Exited(_)) {
-            let _ = self.child.start_kill();
-            let _ = self.child.kill();
+            self.kill_child();
         } else {
             // The leader exited; take any leftover group members with it so they can't hold the pipes.
-            let _ = self.child.kill();
+            self.kill_child();
         }
         self.drain();
         let duration = self.start.elapsed();
