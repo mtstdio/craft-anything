@@ -68,7 +68,7 @@ jobs:
 
   macos:
     name: "macOS Universal Package"
-    needs: [windows]
+    needs: [check]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -92,16 +92,19 @@ jobs:
 
   release:
     name: "Publish GitHub Release"
+    if: always() && !cancelled() && (needs.windows.result == 'success' || needs.macos.result == 'success')
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Download Windows artifacts
+        if: needs.windows.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: release-windows
           path: dist/release
       - name: Download macOS artifacts
+        if: needs.macos.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: release-macos
