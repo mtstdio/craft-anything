@@ -23,16 +23,8 @@ impl AgentAdapter for Antigravity {
         if let Some(r) = cx.resume {
             a.extend(["--conversation".into(), r.to_string()]);
         }
-        a.extend(["--input-format".into(), "text".into(), "--output-format".into(), "stream-json".into()]);
+        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), format!("{}{}", cx.preamble, cx.prompt)]);
         a
-    }
-
-    fn prompt_on_stdin(&self) -> bool {
-        true
-    }
-
-    fn stdin_text(&self, preamble: &str, prompt: &str) -> String {
-        format!("{preamble}{prompt}")
     }
 
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
@@ -180,7 +172,7 @@ mod tests {
     #[test]
     fn antigravity_args_construction() {
         let default_opts = BackendOptions::default();
-        assert_eq!(args(false, None, &default_opts), ["--input-format", "text", "--output-format", "stream-json"]);
+        assert_eq!(args(false, None, &default_opts), ["--output-format", "stream-json", "-p", "PRE analyse repo"]);
 
         let builder_opts =
             BackendOptions { cli_model: Some("Gemini 3.8 Flash (Medium)".into()), args: vec!["--add-dir".into(), "/repo".into()], ..Default::default() };
@@ -194,14 +186,12 @@ mod tests {
                 "Gemini 3.8 Flash (Medium)",
                 "--conversation",
                 "conv-123",
-                "--input-format",
-                "text",
                 "--output-format",
                 "stream-json",
+                "-p",
+                "PRE analyse repo",
             ]
         );
-        assert!(Antigravity.prompt_on_stdin());
-        assert_eq!(Antigravity.stdin_text("PRE ", "prompt"), "PRE prompt");
         assert!(Antigravity.resumes());
         assert_eq!(Antigravity.required_flags(), (&["--help"][..], &["--output-format", "stream-json"][..]));
         assert!(AgentAdapters::built_in().for_agent("antigravity").ids().contains(&"antigravity"));

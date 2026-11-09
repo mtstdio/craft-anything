@@ -23,6 +23,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all -- --check
+      - name: Build CLI helper (required by ai tests)
+        run: cargo build -p craft-anything-cli
       - name: Run tests
         run: cargo test -p craft-anything-platform -p craft-anything-ai -p craft-anything-ui-egui
       - name: Layers and locks check
@@ -49,22 +51,56 @@ jobs:
         run: packaging/macos/package.sh --arch universal
       - name: Verify macOS package
         run: packaging/macos/verify.sh --arch universal
-      - name: Upload artifacts
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-release-artifacts
+          name: release-macos
+          path: dist/release/*
+
+  windows:
+    name: "Windows x64 Package"
+    needs: [check]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WiX toolset v5
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+      - name: Clone craft-fonts
+        shell: pwsh
+        run: git clone --depth 1 https://github.com/storytold/craft-fonts.git "$env:GITHUB_WORKSPACE\craft-fonts"
+      - name: Build and package Windows x64
+        shell: pwsh
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}\craft-fonts
+        run: pwsh packaging/windows/package.ps1 -Arch x64
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
           path: dist/release/*
 
   release:
     name: "Publish GitHub Release"
-    needs: [macos]
+    needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download artifacts
+      - name: Download macOS artifacts
         uses: actions/download-artifact@v4
         with:
-          name: macos-release-artifacts
+          name: release-macos
+          path: dist/release
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
           path: dist/release
       - name: Resolve version
         id: get_version
@@ -80,10 +116,11 @@ jobs:
           body: |
             ## Craft Anything ${{ env.TAG }}
             
-            ### Fixes in this release:
-            - **Antigravity Resiliency**: Fixed stream freeze and hang on API/TLS network errors (`tls: bad record MAC`); prompts now stream via stdin to prevent CLI argument overflow; automatically classifies transient errors for seamless continuation via `--conversation`.
+            ### Fixes & Improvements in this release:
+            - **Antigravity Resiliency**: Fixed stream freeze and hang on API/TLS network errors (`tls: bad record MAC`); automatically classifies transient errors for seamless continuation via `--conversation`.
             - **Process Cleanup**: Enforced 3s post-result process group reaping and non-blocking process termination in `Supervisor`, eliminating hangs after stream error events.
             - **Pause & Resume Fix**: Added 2s stop timeout in rebuild worker loop and cleaned up `pausing` state in UI on run completion to prevent getting stuck in "Pausing…".
+            - **Cross-Platform Releases**: Includes macOS Universal DMG / CLI and Windows x64 MSI / Portable ZIP packages.
           files: |
             dist/release/*
         env:
