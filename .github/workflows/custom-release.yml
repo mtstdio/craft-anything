@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check:
     name: "Quality & Tests"
@@ -32,30 +36,6 @@ jobs:
           cargo xtask layers
           cargo xtask locks
           cargo xtask secrets
-
-  macos:
-    name: "macOS Universal Package"
-    needs: [check]
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - name: Clone craft-fonts
-        run: git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts"
-      - name: Build and package macOS universal
-        env:
-          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
-        run: packaging/macos/package.sh --arch universal
-      - name: Verify macOS package
-        run: packaging/macos/verify.sh --arch universal
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos
-          path: dist/release/*
 
   windows:
     name: "Windows x64 Package"
@@ -86,21 +66,45 @@ jobs:
           name: release-windows
           path: dist/release/*
 
+  macos:
+    name: "macOS Universal Package"
+    needs: [windows]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone craft-fonts
+        run: git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts"
+      - name: Build and package macOS universal
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: packaging/macos/package.sh --arch universal
+      - name: Verify macOS package
+        run: packaging/macos/verify.sh --arch universal
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist/release/*
+
   release:
     name: "Publish GitHub Release"
-    needs: [macos, windows]
+    needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: release-macos
-          path: dist/release
       - name: Download Windows artifacts
         uses: actions/download-artifact@v4
         with:
           name: release-windows
+          path: dist/release
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos
           path: dist/release
       - name: Resolve version
         id: get_version
