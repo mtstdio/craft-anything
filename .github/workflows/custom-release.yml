@@ -36,7 +36,7 @@ jobs:
   macos:
     name: "macOS Universal Package"
     needs: [check]
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
