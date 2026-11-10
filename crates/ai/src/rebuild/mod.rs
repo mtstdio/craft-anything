@@ -1253,7 +1253,7 @@ impl Worker {
                                 format!("The builder stopped ({why}). Picking up where it left off…")
                             };
                             self.step(ws, Step::Build, Status::Building, &note)?;
-                            if tries >= 2 { 5 } else { 30 * tries }
+                            30 * tries
                         }
                     };
                     wait_for(&self.stop, seconds)?;
