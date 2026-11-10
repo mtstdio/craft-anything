@@ -881,7 +881,7 @@ fn nothing_done(backend: &str) -> AgentEvent {
 /// next message; one it was asked to continue but doesn't have is forgotten and flagged in
 /// `state.lost` before the error that says so is sent.
 fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, stop: &Stop, state: &RunState) -> AgentEvent {
-    let RunState { session, verified, lost, failure } = state;
+    let RunState { session, verified, lost, failure, compact_next } = state;
     let name = spec.config.name.clone();
     let agent = spec.config.model.clone();
     let program = match program_of(&spec.config, &spec.options) {
@@ -999,7 +999,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     // Some once tried, recorded or not.
     let held: Arc<Mutex<Option<Option<unfinished::Held>>>> = Arc::new(Mutex::new(None));
 
-    let should_compact = adapter.resumes() && resume.is_some() && state.compact_next.swap(false, Ordering::SeqCst);
+    let should_compact = adapter.resumes() && resume.is_some() && compact_next.swap(false, Ordering::SeqCst);
     let mut current_text = if should_compact && !text.trim_start().starts_with("/compact") { format!("/compact {text}") } else { text.to_string() };
     let mut current_resume = resume.clone();
     let mut attempts = 0u32;
@@ -1099,7 +1099,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         let result = proc.run();
         let p = parser.lock().unwrap_or_else(PoisonError::into_inner);
         if p.compact_next {
-            state.compact_next.store(true, Ordering::SeqCst);
+            compact_next.store(true, Ordering::SeqCst);
         }
         if p.session_missing {
             // The id it reported is the one it couldn't find: the next message starts a new session.

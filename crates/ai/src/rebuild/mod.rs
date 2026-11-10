@@ -1247,12 +1247,12 @@ impl Worker {
                             secs.saturating_add(1).min(crate::failure::MAX_RETRY_WAIT)
                         }
                         None => {
-                            let msg = if tries >= 2 {
-                                "The builder's session was interrupted repeatedly. Starting a fresh session from the current project files…"
+                            let note = if tries >= 2 {
+                                format!("The builder stopped repeatedly ({why}). Starting a fresh session from the current project files…")
                             } else {
-                                "The builder stopped. Picking up where it left off…"
+                                format!("The builder stopped ({why}). Picking up where it left off…")
                             };
-                            self.step(ws, Step::Build, Status::Building, msg)?;
+                            self.step(ws, Step::Build, Status::Building, &note)?;
                             if tries >= 2 { 5 } else { 30 * tries }
                         }
                     };
