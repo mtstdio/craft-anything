@@ -7,6 +7,21 @@ use super::*;
 
 pub struct Antigravity;
 
+/// Proactive compaction watermark: when a turn accumulates >= 15M tokens (well before the ~70M TLS crash zone),
+/// request compaction on the next turn.
+pub const PROACTIVE_COMPACT_TOKENS: u64 = 15_000_000;
+
+/// True when the agent stops work to output a `/compact` SOS request due to an oversized conversation.
+pub(crate) fn reply_requests_compact(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("/compact") {
+        return false;
+    }
+    const CONTEXT_HINTS: &[&str] =
+        &["上下文", "会话", "历史", "数据量", "连接", "传输", "指令", "对话框", "context", "conversation", "token", "history", "connection"];
+    CONTEXT_HINTS.iter().any(|h| text.contains(h) || lower.contains(h))
+}
+
 impl AgentAdapter for Antigravity {
     fn ids(&self) -> &'static [&'static str] {
         &["antigravity", "agy"]
@@ -23,7 +38,20 @@ impl AgentAdapter for Antigravity {
         if let Some(r) = cx.resume {
             a.extend(["--conversation".into(), r.to_string()]);
         }
-        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), format!("{}{}", cx.preamble, cx.prompt)]);
+        let prompt = cx.prompt.trim_start();
+        let p_arg = if let Some(rest) = prompt.strip_prefix("/compact") {
+            let rest = rest.trim_start();
+            if rest.is_empty() {
+                format!("/compact {}", cx.preamble.trim())
+            } else if cx.preamble.trim().is_empty() {
+                format!("/compact {rest}")
+            } else {
+                format!("/compact {} {rest}", cx.preamble.trim())
+            }
+        } else {
+            format!("{}{}", cx.preamble, cx.prompt)
+        };
+        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), p_arg]);
         a
     }
 
@@ -58,7 +86,12 @@ impl AgentAdapter for Antigravity {
                 match step_type {
                     "agent_response" => {
                         if let Some(text) = su.get("text_delta").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                            out.push(AgentEvent::TextDelta { text: text.to_string() });
+                            if reply_requests_compact(text) {
+                                p.compact_requested = true;
+                                p.compact_next = true;
+                            } else {
+                                out.push(AgentEvent::TextDelta { text: text.to_string() });
+                            }
                         }
                     }
                     "tool" => {
@@ -90,12 +123,23 @@ impl AgentAdapter for Antigravity {
                         let out_tok = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
                         let think_tok = u.get("thinking_tokens").and_then(Value::as_u64).unwrap_or(0);
                         p.output_tokens = out_tok.saturating_add(think_tok);
+                        if p.input_tokens >= PROACTIVE_COMPACT_TOKENS {
+                            p.compact_next = true;
+                        }
                     }
-                    if res.get("status").and_then(Value::as_str) == Some("ERROR") {
-                        let reply = res.get("response").and_then(Value::as_str).unwrap_or_default();
+                    let reply = res.get("response").and_then(Value::as_str).unwrap_or_default();
+                    if reply_requests_compact(reply) {
+                        p.compact_requested = true;
+                        p.compact_next = true;
+                        out.push(AgentEvent::Status { text: "Context is large; compacting conversation and continuing…".into() });
+                    } else if res.get("status").and_then(Value::as_str) == Some("ERROR") {
                         let why = res.get("error").and_then(Value::as_str).unwrap_or("run failed");
                         if reply.trim().is_empty() {
-                            p.failure = Some(antigravity_failure(why));
+                            let failure = antigravity_failure(why);
+                            if failure.kind == FailureKind::Transient {
+                                p.compact_next = true;
+                            }
+                            p.failure = Some(failure);
                             out.push(AgentEvent::Error { message: format!("Antigravity: {why}"), remediation: None, log: None });
                         } else {
                             // Antigravity keeps reporting a conversation's old error (its `error_id`
@@ -111,7 +155,11 @@ impl AgentAdapter for Antigravity {
             }
             "error" => {
                 let msg = v.pointer("/error/message").or_else(|| v.get("error")).and_then(Value::as_str).unwrap_or("unknown error");
-                p.failure = Some(antigravity_failure(msg));
+                let failure = antigravity_failure(msg);
+                if failure.kind == FailureKind::Transient {
+                    p.compact_next = true;
+                }
+                p.failure = Some(failure);
                 out.push(AgentEvent::Error { message: format!("Antigravity: {msg}"), remediation: None, log: None });
             }
             _ => {}
@@ -359,5 +407,107 @@ mod tests {
         });
         let evs = p.line(&no_reply.to_string());
         assert!(matches!(evs[0], AgentEvent::Error { .. }), "an error with nothing delivered still fails the turn");
+    }
+
+    #[test]
+    fn antigravity_compact_prompt_placement() {
+        let default_opts = BackendOptions::default();
+        let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
+
+        let args1 = Antigravity.args(&ArgsCx {
+            options: &default_opts,
+            prompt: "/compact please continue",
+            preamble: "You are building. ",
+            mcp: &mcp,
+            resume: Some("conv-1"),
+            builder: true,
+            reads_checked: false,
+            question: false,
+        });
+        let p_arg1 = args1.iter().skip_while(|a| *a != "-p").nth(1).unwrap();
+        assert!(p_arg1.starts_with("/compact "), "must start with /compact, got: {p_arg1}");
+        assert_eq!(p_arg1, "/compact You are building. please continue");
+
+        let args2 = Antigravity.args(&ArgsCx {
+            options: &default_opts,
+            prompt: "/compact",
+            preamble: "You are building. ",
+            mcp: &mcp,
+            resume: Some("conv-1"),
+            builder: true,
+            reads_checked: false,
+            question: false,
+        });
+        let p_arg2 = args2.iter().skip_while(|a| *a != "-p").nth(1).unwrap();
+        assert_eq!(p_arg2, "/compact You are building.");
+    }
+
+    #[test]
+    fn antigravity_proactive_compact_watermark() {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(Antigravity);
+        let mut p = StreamParser::new(adapter);
+        let result = json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-456",
+                "status": "SUCCESS",
+                "response": "Done with step.",
+                "usage": {
+                    "input_tokens": 10_000_000,
+                    "cache_read_tokens": 6_000_000,
+                    "output_tokens": 100,
+                    "thinking_tokens": 0,
+                    "total_tokens": 16_000_100
+                }
+            }
+        });
+        let _ = p.line(&result.to_string());
+        assert_eq!(p.input_tokens, 16_000_000);
+        assert!(p.compact_next, "should trigger compact_next when input_tokens >= 15M");
+    }
+
+    #[test]
+    fn antigravity_intercepts_compact_sos_silently() {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(Antigravity);
+        let mut p = StreamParser::new(adapter);
+
+        // Step 1: Model streams an SOS refusal delta
+        let sos_step = json!({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "conv-456",
+                "step_index": 1,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": "当前会话累积数据量过大导致连接频繁异常，请在对话框输入 /compact 指令压缩会话上下文以确保后续交互稳定。"
+            }
+        });
+        let evs = p.line(&sos_step.to_string());
+        // Should NOT emit TextDelta to the user
+        assert!(evs.is_empty(), "SOS refusal text must not be emitted to user");
+        assert!(p.compact_requested);
+        assert!(p.compact_next);
+
+        // Step 2: Result event carrying the SOS message with sticky ERROR
+        let sos_result = json!({
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-456",
+                "status": "ERROR",
+                "response": "当前会话累积数据量过大导致连接频繁异常，请在对话框输入 /compact 指令压缩会话上下文以确保后续交互稳定。",
+                "error": "API error (attempt 2): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": remote error: tls: bad record MAC",
+                "usage": {"input_tokens": 76_000_000, "output_tokens": 50, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 76_000_050}
+            }
+        });
+        let evs = p.line(&sos_result.to_string());
+        // Should emit a calm Status event, NOT an Error event!
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            AgentEvent::Status { text } => assert!(text.contains("compacting conversation"), "got {text}"),
+            other => panic!("expected Status event, got {other:?}"),
+        }
+        assert!(p.compact_requested);
+        assert!(p.compact_next);
+        assert_eq!(p.failure, None, "should not treat compact request as fatal failure yet");
     }
 }

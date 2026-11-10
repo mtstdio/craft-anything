@@ -848,7 +848,15 @@ impl Worker {
         let mut prompt = match &opts.message {
             // An agent with a saved session gets the follow-up; one without (an API loop) starts
             // from the brief with the request added.
-            Some(m) if !first && has_history => follow_up(m, kind, api_loop) + &now(),
+            Some(m) if !first && has_history => {
+                if m.trim_start().starts_with("/compact") {
+                    let rest = m.trim_start().strip_prefix("/compact").unwrap_or_default().trim_start();
+                    let follow = if rest.is_empty() { continue_prompt(kind, api_loop) } else { follow_up(rest, kind, api_loop) };
+                    format!("/compact {follow}{}", now())
+                } else {
+                    follow_up(m, kind, api_loop) + &now()
+                }
+            }
             // Carrying on after a stop: the same, told to finish what it was doing.
             None if carrying_on && !first && has_history => continue_prompt(kind, api_loop) + &now(),
             _ => {
@@ -1239,15 +1247,35 @@ impl Worker {
                             secs.saturating_add(1).min(crate::failure::MAX_RETRY_WAIT)
                         }
                         None => {
-                            self.step(ws, Step::Build, Status::Building, &format!("The builder stopped ({why}). Picking up where it left off…"))?;
-                            30 * tries
+                            let msg = if tries >= 2 {
+                                "The builder's session was interrupted repeatedly. Starting a fresh session from the current project files…"
+                            } else {
+                                "The builder stopped. Picking up where it left off…"
+                            };
+                            self.step(ws, Step::Build, Status::Building, msg)?;
+                            if tries >= 2 { 5 } else { 30 * tries }
                         }
                     };
                     wait_for(&self.stop, seconds)?;
                     self.stop.check()?;
-                    retry = true;
+                    if tries >= 2 {
+                        agent.clear_session();
+                        Self::remember_session(ws, None, deep)?;
+                        let clean = fresh.take().unwrap_or_else(|| {
+                            format!("{prompt}\n\nPlease inspect the current codebase in `app/` and continue building from where the previous attempt left off.")
+                        });
+                        prompt = clean;
+                        retry = false;
+                    } else {
+                        retry = true;
+                    }
                 }
-                r => return r,
+                r => {
+                    if r.is_err() {
+                        let _ = Self::remember_session(ws, None, deep);
+                    }
+                    return r;
+                }
             }
         }
     }

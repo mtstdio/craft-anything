@@ -463,6 +463,10 @@ pub struct StreamParser {
     pub session_missing: bool,
     /// A protocol fact about the failed turn, independent of the text shown to the person.
     pub failure: Option<TurnFailure>,
+    /// Request compaction on the next turn due to high token count or transient disconnection.
+    pub compact_next: bool,
+    /// The agent returned an SOS request asking for /compact instead of performing the task.
+    pub compact_requested: bool,
 }
 
 fn short_tool(name: &str) -> String {
@@ -509,6 +513,8 @@ impl StreamParser {
             saw_result: false,
             session_missing: false,
             failure: None,
+            compact_next: false,
+            compact_requested: false,
         }
     }
 
@@ -744,6 +750,7 @@ pub struct CliConversation {
     /// The last run's saved session wasn't there (see [`Conversation::session_lost`]).
     lost: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<TurnFailure>>>,
+    compact_next: Arc<AtomicBool>,
 }
 
 impl CliConversation {
@@ -762,6 +769,7 @@ impl CliConversation {
             verified: Arc::default(),
             lost: Arc::default(),
             failure: Arc::default(),
+            compact_next: Arc::default(),
         }
     }
 
@@ -783,7 +791,13 @@ impl CliConversation {
         self.lost.store(false, Ordering::SeqCst);
         *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let (spec, tx, stop, busy) = (self.spec.clone(), self.tx.clone(), self.stop.clone(), self.busy.clone());
-        let state = RunState { session: self.session.clone(), verified: self.verified.clone(), lost: self.lost.clone(), failure: self.failure.clone() };
+        let state = RunState {
+            session: self.session.clone(),
+            verified: self.verified.clone(),
+            lost: self.lost.clone(),
+            failure: self.failure.clone(),
+            compact_next: self.compact_next.clone(),
+        };
         let text = text.to_string();
         let spawned = std::thread::Builder::new().name("ai-cli".into()).spawn(move || {
             let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_cli(&spec, &text, retry, &tx, &stop, &state))).unwrap_or_else(|_| {
@@ -845,6 +859,7 @@ struct RunState {
     verified: Arc<Mutex<Option<bool>>>,
     lost: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<TurnFailure>>>,
+    compact_next: Arc<AtomicBool>,
 }
 
 /// End a turn: take the next message first, then say the turn is done (`send(done)`), since
@@ -942,8 +957,6 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         return nothing_done(&name);
     }
     let access = access_for(spec.builder.is_some(), spec.deep, spec.question);
-    let args = build_args(adapter.as_ref(), &spec.options, text, &preamble, &mcp, if adapter.resumes() { resume.as_deref() } else { None }, access);
-    let shown = FailureContext::new(&program, &args, text, remote.as_deref(), spec);
     // A builder turn may take hours and sit silent for long stretches: Ghidra's first look at a big
     // game, an engine build, or the person answering a question. Claude Code's own limits are
     // raised to match, so nothing cuts a long clone short (its defaults stop a quiet tool call at
@@ -968,10 +981,6 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     {
         env.push((var, dir.to_string()));
     }
-    let (prog, argv) = match &remote {
-        Some(host) => ("ssh".to_string(), crate::ssh::ssh_line_args(host, remote_command(&program, args, &env))),
-        None => (program.clone(), args),
-    };
     let _ =
         tx.send(AgentEvent::Status { text: format!("Asking {}{}…", display_for(&agent), remote.as_ref().map(|h| format!(" on {h}")).unwrap_or_default()) });
     // Sessions earlier turns left behind when Craft Anything was killed mid-turn (#1115). Off this
@@ -989,162 +998,199 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let records = records.filter(|_| adapter.discards_sessions());
     // Some once tried, recorded or not.
     let held: Arc<Mutex<Option<Option<unfinished::Held>>>> = Arc::new(Mutex::new(None));
-    let (held2, agent2, program2, host2) = (held.clone(), agent.clone(), program.clone(), remote.clone());
-    let parser = Arc::new(Mutex::new(StreamParser::new(adapter.clone())));
-    let (p2, tx2, tx_err, lost2, failure2) = (parser.clone(), tx.clone(), tx.clone(), lost.clone(), failure.clone());
-    let failed_tools = Arc::new(AtomicBool::new(false));
-    let (failed_tools2, failed_tools3) = (failed_tools.clone(), failed_tools.clone());
-    let stop2 = stop.clone();
-    const POST_RESULT_GRACE: Duration = Duration::from_secs(3);
-    let result_at = Arc::new(Mutex::new(None::<Instant>));
-    let (result_at2, result_at3) = (result_at.clone(), result_at.clone());
-    let reaped_after_result = Arc::new(AtomicBool::new(false));
-    let reaped_after_result2 = reaped_after_result.clone();
-    let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
-        .args(&argv)
-        .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
-        .idle_timeout(Duration::from_secs(quiet));
-    for (k, v) in &env {
-        proc = proc.env(k, v.as_str());
-    }
-    let mut proc = proc
-        .stdout_cap(4 * 1024 * 1024)
-        .cancel_when(move || {
-            if stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst) {
-                return true;
-            }
-            if let Some(at) = *result_at2.lock().unwrap_or_else(PoisonError::into_inner) {
-                if at.elapsed() >= POST_RESULT_GRACE {
-                    reaped_after_result2.store(true, Ordering::SeqCst);
+
+    let should_compact = adapter.resumes() && resume.is_some() && state.compact_next.swap(false, Ordering::SeqCst);
+    let mut current_text = if should_compact && !text.trim_start().starts_with("/compact") { format!("/compact {text}") } else { text.to_string() };
+    let mut current_resume = resume.clone();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let args = build_args(
+            adapter.as_ref(),
+            &spec.options,
+            &current_text,
+            &preamble,
+            &mcp,
+            if adapter.resumes() { current_resume.as_deref() } else { None },
+            access,
+        );
+        let shown = FailureContext::new(&program, &args, &current_text, remote.as_deref(), spec);
+        let (prog, argv) = match &remote {
+            Some(host) => ("ssh".to_string(), crate::ssh::ssh_line_args(host, remote_command(&program, args, &env))),
+            None => (program.clone(), args),
+        };
+        let (held2, agent2, program2, host2) = (held.clone(), agent.clone(), program.clone(), remote.clone());
+        let parser = Arc::new(Mutex::new(StreamParser::new(adapter.clone())));
+        let (p2, tx2, tx_err, lost2, failure2) = (parser.clone(), tx.clone(), tx.clone(), lost.clone(), failure.clone());
+        let failed_tools = Arc::new(AtomicBool::new(false));
+        let (failed_tools2, failed_tools3) = (failed_tools.clone(), failed_tools.clone());
+        let stop2 = stop.clone();
+        const POST_RESULT_GRACE: Duration = Duration::from_secs(3);
+        let result_at = Arc::new(Mutex::new(None::<Instant>));
+        let (result_at2, result_at3) = (result_at.clone(), result_at.clone());
+        let reaped_after_result = Arc::new(AtomicBool::new(false));
+        let reaped_after_result2 = reaped_after_result.clone();
+        let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
+            .args(&argv)
+            .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
+            .idle_timeout(Duration::from_secs(quiet));
+        for (k, v) in &env {
+            proc = proc.env(k, v.as_str());
+        }
+        let held_records = records.clone();
+        let mut proc = proc
+            .stdout_cap(4 * 1024 * 1024)
+            .cancel_when(move || {
+                if stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst) {
                     return true;
                 }
-            }
-            false
-        })
-        .on_stdout_line(move |l| {
-            if failed_tools3.load(Ordering::SeqCst) {
-                return;
-            }
-            let mut p = p2.lock().unwrap_or_else(PoisonError::into_inner);
-            let events = p.line(l);
-            if p.saw_result {
-                let mut at = result_at3.lock().unwrap_or_else(PoisonError::into_inner);
-                if at.is_none() {
-                    *at = Some(Instant::now());
+                if let Some(at) = *result_at2.lock().unwrap_or_else(PoisonError::into_inner) {
+                    if at.elapsed() >= POST_RESULT_GRACE {
+                        reaped_after_result2.store(true, Ordering::SeqCst);
+                        return true;
+                    }
                 }
-            }
-            if let (Some(dir), Some(id)) = (&records, &p.run_session) {
-                let mut h = held2.lock().unwrap_or_else(PoisonError::into_inner);
-                if h.is_none() {
-                    *h = Some(unfinished::Held::record(dir, &unfinished::Entry::new(&agent2, &program2, host2.as_deref(), id)).ok());
-                }
-            }
-            // Said before the error that follows it, so whoever reads the error can tell.
-            if p.session_missing {
-                lost2.store(true, Ordering::SeqCst);
-            }
-            if let Some(failed) = p.failure {
-                *failure2.lock().unwrap_or_else(PoisonError::into_inner) = Some(failed);
-                if failed.kind == FailureKind::ToolsUnavailable {
-                    failed_tools3.store(true, Ordering::SeqCst);
-                }
-            }
-            for e in events {
-                let _ = tx2.send(e);
-            }
-        })
-        .on_stderr_line(move |l| {
-            if !l.trim().is_empty() {
-                let _ = tx_err.send(AgentEvent::Output { text: l.to_string() });
-            }
-        })
-        .remediation(format!("Install {}, or choose its program in Settings → AI.", display_for(&agent)));
-    if let Some(p) = spec.project.as_ref().filter(|_| remote.is_none()) {
-        proc = proc.cwd(p);
-    }
-    if adapter.prompt_on_stdin() {
-        proc = proc.stdin_bytes(adapter.stdin_text(&preamble, text));
-    }
-    let result = proc.run();
-    let p = parser.lock().unwrap_or_else(PoisonError::into_inner);
-    if p.session_missing {
-        // The id it reported is the one it couldn't find: the next message starts a new session.
-        *session.lock().unwrap_or_else(PoisonError::into_inner) = None;
-    } else if let Some(id) = &p.session_id {
-        *session.lock().unwrap_or_else(PoisonError::into_inner) = Some(id.clone());
-    }
-    if p.failure.is_none() {
-        let failed = match &result {
-            Ok(out) if !out.success => Some(TurnFailure::process_exit(out.code)),
-            Err(e) if e.code != ErrorCode::Cancelled => Some(TurnFailure::from_process(e)),
-            _ => None,
-        };
-        *failure.lock().unwrap_or_else(PoisonError::into_inner) = failed;
-    }
-    let unfinished = match &result {
-        Ok(out) => !out.success,
-        Err(_) if reaped_after_result.load(Ordering::SeqCst) => p.failure.is_some(),
-        Err(_) => true,
-    };
-    match result {
-        // The protocol already named the required tool server. Stop the owned process without
-        // replacing that useful error with the cancellation used to stop it.
-        result if failed_tools.load(Ordering::SeqCst) => {
-            let (out, error) = match &result {
-                Ok(out) => (Some(out), None),
-                Err(e) => (None, Some(e.message.as_str())),
-            };
-            if let Some(path) = shown.save_with(&agent, out, Some("Craft Anything's tools did not start."), error).0 {
-                let _ = tx.send(AgentEvent::Status { text: format!("The details are in {}", path.display()) });
-            }
-        }
-        // It said why already, and there's nothing more in its output to keep.
-        Ok(_) if p.session_missing => {}
-        Ok(out) if !out.success && !p.saw_result => {
-            let _ = tx.send(shown.exit_event(&agent, &out));
-        }
-        Ok(out) if !out.success => {
-            // The agent already said what went wrong; keep the rest for anyone looking into it.
-            if let Some(path) = shown.save(&agent, Some(&out), None).0 {
-                let _ = tx.send(AgentEvent::Status { text: format!("The details are in {}", path.display()) });
-            }
-        }
-        Ok(_) => {}
-        Err(e) if e.code == craft_anything_evidence::ErrorCode::Cancelled => {
-            if !reaped_after_result.load(Ordering::SeqCst) {
-                let _ = tx.send(AgentEvent::Status { text: "Stopped.".into() });
-            }
-        }
-        Err(e) => {
-            let _ = tx.send(shown.error_event(&agent, e));
-        }
-    }
-    // #1115: a turn that didn't finish leaves its session marked as running, and the agent's
-    // background service may pick it up later and carry on with nobody watching.
-    let held = held.lock().unwrap_or_else(PoisonError::into_inner).take().flatten();
-    let gone = match &p.run_session {
-        Some(id) if unfinished => match adapter.discard_unfinished(&program, id, remote.as_deref()) {
-            Ok(()) => true,
-            Err(e) => {
-                let fix = e.remediation.map(|r| format!(" {r}")).unwrap_or_default();
-                let _ = tx.send(AgentEvent::Status { text: format!("Couldn't remove {}'s unfinished session {id}: {}.{fix}", display_for(&agent), e.message) });
                 false
+            })
+            .on_stdout_line(move |l| {
+                if failed_tools3.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut p = p2.lock().unwrap_or_else(PoisonError::into_inner);
+                let events = p.line(l);
+                if p.saw_result {
+                    let mut at = result_at3.lock().unwrap_or_else(PoisonError::into_inner);
+                    if at.is_none() {
+                        *at = Some(Instant::now());
+                    }
+                }
+                if let (Some(dir), Some(id)) = (&held_records, &p.run_session) {
+                    let mut h = held2.lock().unwrap_or_else(PoisonError::into_inner);
+                    if h.is_none() {
+                        *h = Some(unfinished::Held::record(dir, &unfinished::Entry::new(&agent2, &program2, host2.as_deref(), id)).ok());
+                    }
+                }
+                // Said before the error that follows it, so whoever reads the error can tell.
+                if p.session_missing {
+                    lost2.store(true, Ordering::SeqCst);
+                }
+                if let Some(failed) = p.failure {
+                    *failure2.lock().unwrap_or_else(PoisonError::into_inner) = Some(failed);
+                    if failed.kind == FailureKind::ToolsUnavailable {
+                        failed_tools3.store(true, Ordering::SeqCst);
+                    }
+                }
+                for e in events {
+                    let _ = tx2.send(e);
+                }
+            })
+            .on_stderr_line(move |l| {
+                if !l.trim().is_empty() {
+                    let _ = tx_err.send(AgentEvent::Output { text: l.to_string() });
+                }
+            })
+            .remediation(format!("Install {}, or choose its program in Settings → AI.", display_for(&agent)));
+        if let Some(p) = spec.project.as_ref().filter(|_| remote.is_none()) {
+            proc = proc.cwd(p);
+        }
+        if adapter.prompt_on_stdin() {
+            proc = proc.stdin_bytes(adapter.stdin_text(&preamble, &current_text));
+        }
+        let result = proc.run();
+        let p = parser.lock().unwrap_or_else(PoisonError::into_inner);
+        if p.compact_next {
+            state.compact_next.store(true, Ordering::SeqCst);
+        }
+        if p.session_missing {
+            // The id it reported is the one it couldn't find: the next message starts a new session.
+            *session.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        } else if let Some(id) = &p.session_id {
+            *session.lock().unwrap_or_else(PoisonError::into_inner) = Some(id.clone());
+            current_resume = Some(id.clone());
+        }
+
+        if p.compact_requested && attempts < 2 && !stop.is_stopped() && adapter.resumes() {
+            let _ = tx.send(AgentEvent::Status { text: "Context is large; compacting conversation and continuing…".into() });
+            if !current_text.trim_start().starts_with("/compact") {
+                current_text = format!("/compact {current_text}");
             }
-        },
-        _ => true,
-    };
-    // Kept (unlocked) when the delete failed, so a later sweep tries again.
-    if gone && let Some(h) = held {
-        h.done();
+            continue;
+        }
+
+        if p.failure.is_none() {
+            let failed = match &result {
+                Ok(out) if !out.success => Some(TurnFailure::process_exit(out.code)),
+                Err(e) if e.code != ErrorCode::Cancelled => Some(TurnFailure::from_process(e)),
+                _ => None,
+            };
+            *failure.lock().unwrap_or_else(PoisonError::into_inner) = failed;
+        }
+        let unfinished = match &result {
+            Ok(out) => !out.success,
+            Err(_) if reaped_after_result.load(Ordering::SeqCst) => p.failure.is_some(),
+            Err(_) => true,
+        };
+        match result {
+            // The protocol already named the required tool server. Stop the owned process without
+            // replacing that useful error with the cancellation used to stop it.
+            result if failed_tools.load(Ordering::SeqCst) => {
+                let (out, error) = match &result {
+                    Ok(out) => (Some(out), None),
+                    Err(e) => (None, Some(e.message.as_str())),
+                };
+                if let Some(path) = shown.save_with(&agent, out, Some("Craft Anything's tools did not start."), error).0 {
+                    let _ = tx.send(AgentEvent::Status { text: format!("The details are in {}", path.display()) });
+                }
+            }
+            // It said why already, and there's nothing more in its output to keep.
+            Ok(_) if p.session_missing => {}
+            Ok(out) if !out.success && !p.saw_result => {
+                let _ = tx.send(shown.exit_event(&agent, &out));
+            }
+            Ok(out) if !out.success => {
+                // The agent already said what went wrong; keep the rest for anyone looking into it.
+                if let Some(path) = shown.save(&agent, Some(&out), None).0 {
+                    let _ = tx.send(AgentEvent::Status { text: format!("The details are in {}", path.display()) });
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.code == craft_anything_evidence::ErrorCode::Cancelled => {
+                if !reaped_after_result.load(Ordering::SeqCst) {
+                    let _ = tx.send(AgentEvent::Status { text: "Stopped.".into() });
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(shown.error_event(&agent, e));
+            }
+        }
+        // #1115: a turn that didn't finish leaves its session marked as running, and the agent's
+        // background service may pick it up later and carry on with nobody watching.
+        let held = held.lock().unwrap_or_else(PoisonError::into_inner).take().flatten();
+        let gone = match &p.run_session {
+            Some(id) if unfinished => match adapter.discard_unfinished(&program, id, remote.as_deref()) {
+                Ok(()) => true,
+                Err(e) => {
+                    let fix = e.remediation.map(|r| format!(" {r}")).unwrap_or_default();
+                    let _ =
+                        tx.send(AgentEvent::Status { text: format!("Couldn't remove {}'s unfinished session {id}: {}.{fix}", display_for(&agent), e.message) });
+                    false
+                }
+            },
+            _ => true,
+        };
+        // Kept (unlocked) when the delete failed, so a later sweep tries again.
+        if gone && let Some(h) = held {
+            h.done();
+        }
+        // Claude Code's total is the session's running total (#1187); a question's copy is answered by
+        // question.rs, which keeps no cost for it.
+        let cost_usd = if adapter.ids().contains(&"claude-code") && !spec.question {
+            claude_cost::turn_cost(spec.cost_totals.as_deref(), resume.as_deref(), p.session_id.as_deref(), p.cost_usd)
+        } else {
+            p.cost_usd
+        };
+        return AgentEvent::TurnDone { backend: name, input_tokens: p.input_tokens, output_tokens: p.output_tokens, cost_usd, cost_is_estimate: true };
     }
-    // Claude Code's total is the session's running total (#1187); a question's copy is answered by
-    // question.rs, which keeps no cost for it.
-    let cost_usd = if adapter.ids().contains(&"claude-code") && !spec.question {
-        claude_cost::turn_cost(spec.cost_totals.as_deref(), resume.as_deref(), p.session_id.as_deref(), p.cost_usd)
-    } else {
-        p.cost_usd
-    };
-    AgentEvent::TurnDone { backend: name, input_tokens: p.input_tokens, output_tokens: p.output_tokens, cost_usd, cost_is_estimate: true }
 }
 
 /// What's needed to explain a failed CLI run: the command with the person's message left out, and
@@ -1274,6 +1320,11 @@ impl Conversation for CliConversation {
 
     fn session_id(&self) -> Option<String> {
         CliConversation::session_id(self)
+    }
+
+    fn clear_session(&mut self) {
+        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.compact_next.store(false, Ordering::SeqCst);
     }
 
     /// Set by the last run (see `run_cli`) and cleared when the next message is sent.

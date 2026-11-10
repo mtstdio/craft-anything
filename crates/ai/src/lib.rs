@@ -328,6 +328,8 @@ pub trait Conversation: Send {
     fn session_lost(&self) -> bool {
         false
     }
+    /// Forget the saved session, so the next turn starts fresh.
+    fn clear_session(&mut self) {}
     /// Drain new events (non-blocking).
     fn poll(&mut self) -> Vec<AgentEvent>;
     fn answer_consent(&mut self, call_id: &str, allow: bool);
