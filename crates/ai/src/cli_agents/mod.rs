@@ -854,6 +854,7 @@ fn remote_command(program: &str, args: Vec<String>, env: &[(&'static str, String
 
 /// The run's shared state: the session it continues and reports, whether the agent's flags were
 /// checked, and whether the session it was to continue was missing.
+#[derive(Default)]
 struct RunState {
     session: Arc<Mutex<Option<String>>>,
     verified: Arc<Mutex<Option<bool>>>,
@@ -2928,7 +2929,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
             let options = BackendOptions { acp: Some(false), command: Some("no-such-copilot-xyz".into()), ..Default::default() };
             let spec = CliSpec::new(config, options, false, None);
             let (sender, receiver) = std::sync::mpsc::channel();
-            let state = RunState { session: Arc::default(), verified: Arc::default(), lost: Arc::default(), failure: Arc::default() };
+            let state = RunState::default();
             let done = run_cli(&spec, "hello", false, &sender, &Stop::default(), &state);
             let mut output: Vec<_> = receiver.try_iter().collect();
             output.push(done);
@@ -2965,7 +2966,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
             let mut spec = CliSpec::new(config, BackendOptions::default(), false, None);
             spec.adapters.register(Arc::new(AcpOnlyAgent(guidance)));
             let (sender, receiver) = std::sync::mpsc::channel();
-            let state = RunState { session: Arc::default(), verified: Arc::default(), lost: Arc::default(), failure: Arc::default() };
+            let state = RunState::default();
             let done = run_cli(&spec, "hello", false, &sender, &Stop::default(), &state);
             let mut output: Vec<_> = receiver.try_iter().collect();
             output.push(done);
